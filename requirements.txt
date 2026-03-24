@@ -9,6 +9,7 @@ colorama==0.4.6
 configobj==5.0.9
 configparser==7.2.0
 data==0.4
+decorator==5.2.1
 etelemetry==0.3.1
 filelock==3.25.2
 fitz==0.0.1.dev2
@@ -29,13 +30,16 @@ numpy==2.4.3
 ollama==0.6.1
 pandas==3.0.1
 pathlib==1.0.1
+pillow==12.1.1
 prov==2.1.1
 puremagic==2.1.0
 pydantic==2.12.5
 pydantic_core==2.41.5
 pydot==4.0.1
+PyMuPDF==1.27.2.2
 pyparsing==3.3.2
 python-dateutil==2.9.0.post0
+python-docx==1.2.0
 pyxnat==1.6.4
 rdflib==7.6.0
 requests==2.32.5
@@ -51,4 +55,3 @@ typing_extensions==4.15.0
 tzdata==2025.3
 urllib3==2.6.3
 wheel==0.46.3
-PyMuPDF

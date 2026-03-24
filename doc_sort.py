@@ -3,36 +3,42 @@ import shutil
 import json
 import csv
 import time
-import fitz  # PyMuPDF
+import fitz  # PyMuPDF for PDFs and Images
+import docx  # For Word Documents
 import ollama
 
 # --- Configuration ---
-INPUT_DIR = r"\docs_to_sort"
-BASE_OUTPUT_DIR = r"\categorized_documents"
-COMPLETED_DIR = r"\completed_originals"
-SUMMARY_FILE = r"\document_summary.csv"
+INPUT_DIR = r"./docs_to_sort"
+BASE_OUTPUT_DIR = r"./categorized_documents"
+COMPLETED_DIR = r"./completed_originals"
+SUMMARY_FILE = r"./document_summary.csv"
 
-# Swap models here to test performance
+# The LLM model to use
 ACTIVE_MODEL = "qwen3-vl:8b"
 
-# Multi-page safety limits
+# Processing Limits
 MAX_PAGES_TO_SCAN = 8
 RENDER_DPI = 120
 
-# Number of times to retry failed LLM read
+# How many times the LLM will try to process the file before giving up
 MAX_RETRIES = 3
 
 ALLOWED_CATEGORIES = [
-    "Financial Documents",
+    "Debts",
+    "General Financial",
     "Personal",
     "Hobbies",
-    "Fiction",
+    "Writings or Fiction",
     "Fitness and Health",
     "Food and Recipes",
     "Programming and Data Science",
     "Personal Improvement",
     "Misc",
 ]
+
+# Supported file extensions for the open-source app
+VISION_EXTENSIONS = (".pdf", ".jpg", ".jpeg", ".png", ".tiff", ".tif")
+TEXT_EXTENSIONS = (".txt", ".docx")
 
 
 def setup_directories():
@@ -44,10 +50,7 @@ def setup_directories():
 
 
 def is_file_locked(filepath):
-    """
-    Checks if a file is currently being written to or locked by another process.
-    Renaming a file to itself is the most reliable way to check Windows file locks.
-    """
+    """Check if a file is still being copied or saved."""
     try:
         os.rename(filepath, filepath)
         return False
@@ -55,82 +58,123 @@ def is_file_locked(filepath):
         return True
 
 
-def process_document(file_path, filename):
-    """Renders the PDF and sends it to the local LLM for categorization."""
+def extract_text(file_path, filename):
+    """Extracts raw text from .txt and .docx files."""
     try:
-        doc = fitz.open(file_path)
-        total_pages = len(doc)
-        pages_to_process = min(total_pages, MAX_PAGES_TO_SCAN)
+        if filename.lower().endswith(".txt"):
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                return f.read()
+        elif filename.lower().endswith(".docx"):
+            doc = docx.Document(file_path)
+            return "\n".join([paragraph.text for paragraph in doc.paragraphs])
+    except Exception as e:
+        print(f"Error reading text from {filename}: {e}")
+        return ""
+
+
+def process_document(file_path, filename):
+    """The Dual-Path Engine: Routes the file based on its extension."""
+    try:
+        is_vision = filename.lower().endswith(VISION_EXTENSIONS)
+        is_text = filename.lower().endswith(TEXT_EXTENSIONS)
 
         image_list = []
-        print(f"Extracting {pages_to_process} page(s) from {filename}...")
+        document_text = ""
 
-        for page_num in range(pages_to_process):
-            page = doc.load_page(page_num)
-            pix = page.get_pixmap(dpi=RENDER_DPI)
-            image_list.append(pix.tobytes("jpg"))
+        # --- PATH 1: The Vision Engine (PDFs, Images) ---
+        if is_vision:
+            doc = fitz.open(file_path)
+            total_pages = len(doc)
+            pages_to_process = min(total_pages, MAX_PAGES_TO_SCAN)
+            print(f"Rendering {pages_to_process} page(s) from {filename}...")
 
-        doc.close()
+            for page_num in range(pages_to_process):
+                page = doc.load_page(page_num)
+                # Grayscale to strip visual noise
+                pix = page.get_pixmap(dpi=RENDER_DPI, colorspace=fitz.csGRAY)
+                image_list.append(pix.tobytes("jpg"))
+            doc.close()
 
-        system_prompt = f"""
-        Analyze this {pages_to_process}-page document carefully. It may contain multiple articles, receipts, or distinct sections.
-        1. Write a short 2-3 sentence synopsis summarizing the overall contents.
-        2. Select ONE OR MORE categories from this exact list: {", ".join(ALLOWED_CATEGORIES)}.
-        
-        You must respond ONLY with valid JSON.
-        Format:
-        {{
-            "categories": ["Selected Category 1", "Selected Category 2"],
-            "synopsis": "A brief summary here."
-        }}
-        """
+        # --- PATH 2: The Text Engine (TXT, DOCX) ---
+        elif is_text:
+            print(f"Extracting raw text from {filename}...")
+            document_text = extract_text(file_path, filename)
+            # Truncate text to prevent exploding the LLM's context window (approx 5-6 pages)
+            document_text = document_text[:15000]
+
+        else:
+            return {
+                "categories": ["Misc"],
+                "synopsis": "Unsupported file format.",
+                "time": 0,
+            }
+
+        # --- Unified Prompting ---
+        # Formatted to avoid IDE string-highlighting bugs
+        allowed_cats_str = ", ".join(ALLOWED_CATEGORIES)
+        system_prompt = (
+            f"Analyze this document carefully.\n"
+            f"1. Write a short 2-3 sentence synopsis summarizing the overall contents.\n"
+            f"2. Select ONE OR MORE categories from this exact list: {allowed_cats_str}.\n\n"
+            f"You must respond ONLY with valid JSON.\n"
+            f"Format:\n{{\n"
+            f'    "categories": ["Selected Category 1", "Selected Category 2"],\n'
+            f'    "synopsis": "A brief summary here."\n'
+            f"}}\n"
+        )
+
+        # If it's a text document, append the text directly to the prompt
+        if is_text:
+            system_prompt += f"\n\n--- DOCUMENT TEXT ---\n{document_text}"
 
         print(f"Analyzing {filename} with {ACTIVE_MODEL}...")
-
         start_time = time.time()
 
-        # --- THE RETRY LOOP ---
+        # --- The LLM Call (With Retry Loop) ---
         raw_text = ""
 
         for attempt in range(MAX_RETRIES):
+            # Send images if Vision, send only text if Text
+            messages = [{"role": "user", "content": system_prompt}]
+            if is_vision:
+                messages[0]["images"] = image_list
+
             response = ollama.chat(
                 model=ACTIVE_MODEL,
-                messages=[
-                    {"role": "user", "content": system_prompt, "images": image_list}
-                ],
+                messages=messages,
                 format="json",
             )
 
             raw_text = response["message"]["content"].strip()
-
-            # If the AI actually gave us text, break out of the retry loop
             if raw_text:
                 break
 
-            print(
-                f"  [Attempt {attempt + 1} Failed: AI returned a blank response. Retrying...]"
-            )
-            time.sleep(1)  # Give the GPU a tiny 1-second breather before trying again
+            print(f"  [Attempt {attempt + 1} Failed: Retrying...]")
+            time.sleep(1)
 
         end_time = time.time()
         processing_time = round(end_time - start_time, 2)
 
-        # --- STEP 4: Parse the AI's response safely ---
-        # If it failed all attempts, log it as a potential blank page
+        # --- Safe JSON Parsing ---
         if not raw_text:
             return {
                 "categories": ["Misc"],
-                "synopsis": "Error: AI repeatedly returned an empty response. (Page may be blank or unreadable).",
+                "synopsis": "Error: AI returned empty response.",
                 "time": processing_time,
             }
 
-        # Scrub off markdown formatting if the AI mistakenly included it
-        if raw_text.startswith("```json"):
+        # Safely strip markdown formatting without triggering chat interface or IDE bugs
+        # chr(96) generates a backtick character dynamically
+        MD_FENCE = chr(96) * 3
+
+        if raw_text.startswith(MD_FENCE + "json\n"):
+            raw_text = raw_text[8:]
+        elif raw_text.startswith(MD_FENCE + "json"):
             raw_text = raw_text[7:]
-        elif raw_text.startswith("```"):
+        elif raw_text.startswith(MD_FENCE):
             raw_text = raw_text[3:]
 
-        if raw_text.endswith("```"):
+        if raw_text.endswith(MD_FENCE):
             raw_text = raw_text[:-3]
 
         result = json.loads(raw_text.strip())
@@ -170,20 +214,16 @@ def main():
 
         batch_start = time.time()
         files_processed = 0
-        files_skipped = 0
 
         for filename in os.listdir(INPUT_DIR):
-            if not filename.lower().endswith(".pdf"):
+            # Check against BOTH sets of allowed extensions
+            if not filename.lower().endswith(VISION_EXTENSIONS + TEXT_EXTENSIONS):
                 continue
 
             file_path = os.path.join(INPUT_DIR, filename)
 
-            # --- The File Lock Check ---
             if is_file_locked(file_path):
-                print(
-                    f"⚠️ Skipping '{filename}' - File is currently locked or being saved by the scanner.\n"
-                )
-                files_skipped += 1
+                print(f"⚠️ Skipping '{filename}' - File is locked.\n")
                 continue
 
             analysis = process_document(file_path, filename)
@@ -199,8 +239,7 @@ def main():
             shutil.move(file_path, completed_path)
 
             print(f"✓ Sorted '{filename}' into: {', '.join(categories)}")
-            print(f"  └─ Time taken: {process_time} seconds")
-            print(f"  └─ Moved original to: {COMPLETED_DIR}\n")
+            print(f"  └─ Time taken: {process_time} seconds\n")
 
             writer.writerow(
                 [filename, ", ".join(categories), synopsis, ACTIVE_MODEL, process_time]
@@ -209,11 +248,16 @@ def main():
 
         batch_end = time.time()
 
-        print("--- Batch Summary ---")
-        print(f"Processed: {files_processed} file(s)")
-        print(f"Skipped (Locked): {files_skipped} file(s)")
+        # --- Clean Console Summary ---
+        print("\n=========================================")
         if files_processed > 0:
-            print(f"Total time: {round(batch_end - batch_start, 2)} seconds")
+            print(f"SUCCESS! Batch complete.")
+            print(
+                f"Processed {files_processed} files in {round(batch_end - batch_start, 2)} seconds."
+            )
+        else:
+            print("No valid documents found in the input directory.")
+        print("=========================================")
 
 
 if __name__ == "__main__":
