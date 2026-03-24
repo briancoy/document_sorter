@@ -45,3 +45,4 @@ docs_to_sort/
 categorized_documents/
 completed_originals/
 *.csv
+categorizer_config.json
