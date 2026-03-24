@@ -56,6 +56,26 @@ class CategorizerApp:
         # Handle window close to save config
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
+    def get_ollama_models(self):
+        """Fetch available models from local Ollama instance."""
+        try:
+            response = ollama.list()
+            models = []
+
+            # ollama.list() handles versions differently; this safely checks both
+            for m in response.get("models", []):
+                if hasattr(m, "model"):
+                    models.append(m.model)
+                elif isinstance(m, dict) and "name" in m:
+                    models.append(m["name"])
+
+            if not models:
+                return [self.config.get("model", "qwen3-vl:8b")]
+            return models
+        except Exception as e:
+            print(f"Warning: Could not fetch Ollama models (is Ollama running?): {e}")
+            return [self.config.get("model", "qwen3-vl:8b")]
+
     def load_config(self):
         """Load settings from config file or use defaults."""
         if os.path.exists(CONFIG_FILE):
@@ -144,12 +164,28 @@ class CategorizerApp:
         )
         set_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
 
-        self.model_var = tk.StringVar(value=self.config.get("model", "qwen3-vl:8b"))
+        # Fetch available models for the dropdown
+        available_models = self.get_ollama_models()
+        saved_model = self.config.get("model", "qwen3-vl:8b")
+
+        # Ensure the saved model is always in the list, even if Ollama is currently offline
+        if saved_model not in available_models:
+            available_models.insert(0, saved_model)
+
+        self.model_var = tk.StringVar(value=saved_model)
         self.pages_var = tk.StringVar(value=str(self.config.get("max_pages", 8)))
         self.dpi_var = tk.StringVar(value=str(self.config.get("dpi", 120)))
         self.retries_var = tk.StringVar(value=str(self.config.get("max_retries", 3)))
 
-        self.add_setting_row(set_frame, "Ollama Model:", self.model_var, 0)
+        # Update the first row to use a Combobox
+        self.add_setting_row(
+            set_frame,
+            "Ollama Model:",
+            self.model_var,
+            0,
+            is_combobox=True,
+            values=available_models,
+        )
         self.add_setting_row(set_frame, "Max Pages to Scan:", self.pages_var, 1)
         self.add_setting_row(set_frame, "Render DPI:", self.dpi_var, 2)
         self.add_setting_row(set_frame, "Max Retries:", self.retries_var, 3)
@@ -186,12 +222,20 @@ class CategorizerApp:
         ).grid(row=row, column=2, pady=2)
         parent.columnconfigure(1, weight=1)
 
-    def add_setting_row(self, parent, label_text, string_var, row):
+    def add_setting_row(
+        self, parent, label_text, string_var, row, is_combobox=False, values=None
+    ):
         """Helper to build setting rows."""
         ttk.Label(parent, text=label_text).grid(row=row, column=0, sticky="w", pady=5)
-        ttk.Entry(parent, textvariable=string_var, width=20).grid(
-            row=row, column=1, sticky="e", pady=5
-        )
+
+        if is_combobox:
+            cb = ttk.Combobox(parent, textvariable=string_var, values=values, width=17)
+            cb.grid(row=row, column=1, sticky="e", pady=5)
+        else:
+            ttk.Entry(parent, textvariable=string_var, width=20).grid(
+                row=row, column=1, sticky="e", pady=5
+            )
+
         parent.columnconfigure(1, weight=1)
 
     def browse_directory(self, string_var):
