@@ -19,7 +19,6 @@ DEFAULT_CONFIG = {
     "output_dir": "./categorized_documents",
     "completed_dir": "./completed_originals",
     "categories": [
-        "Debts",
         "General Financial",
         "Personal",
         "Hobbies",
